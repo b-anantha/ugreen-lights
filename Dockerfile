@@ -1,5 +1,5 @@
 # -- Stage 1: Compile the CLI tool from source --
-FROM debian:bookworm-slim AS builder
+FROM debian:trixie-slim AS builder
 
 RUN apt-get update && apt-get install -y build-essential
 
@@ -11,25 +11,33 @@ RUN make
 
 
 # -- Stage 2: Clean runtime image --
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 # Runtime deps:
 #   bash            - lights.sh
 #   iproute2        - `ip route` for gateway / interface detection
 #   iputils-ping    - gateway reachability check
 #   util-linux      - lsblk for disk<->bay mapping
-#   zfsutils-linux  - `zpool status` (ZFS health)
+#   zfsutils-linux  - `zpool status` (ZFS health) — see version note below
 #   smartmontools   - optional SMART health overlay (CHECK_SMART=true)
-# NOTE: we intentionally do NOT modprobe anything here. The i2c-dev module must
-#       be loaded on the TrueNAS HOST; the container only needs /dev/i2c-* + /sys.
-RUN apt-get update && apt-get install -y \
-    bash \
-    iproute2 \
-    iputils-ping \
-    util-linux \
-    zfsutils-linux \
-    smartmontools \
-    && rm -rf /var/lib/apt/lists/*
+#
+# NOTES:
+#  * We intentionally do NOT modprobe anything here. The i2c-dev module must be
+#    loaded on the TrueNAS HOST; the container only needs /dev/i2c-* + /sys.
+#  * The container's `zpool` talks to the HOST kernel's OpenZFS via /dev/zfs, so
+#    the userland version MUST match the host's ZFS major.minor — the ioctl
+#    interface changes between releases (a 2.2 userland fails to init against a
+#    2.3 kernel). This image is Debian 13 "trixie", which ships OpenZFS 2.3.x to
+#    match TrueNAS SCALE (host reported 2.3.4). If you upgrade TrueNAS to a newer
+#    ZFS major.minor, rebuild on a base image carrying that version.
+#  * `zfsutils-linux` is in Debian's `contrib` component (not `main`). No kernel
+#    modules are installed — the container uses the host's ZFS.
+RUN echo "deb http://deb.debian.org/debian trixie main contrib" \
+        > /etc/apt/sources.list.d/contrib.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        bash iproute2 iputils-ping util-linux smartmontools zfsutils-linux && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 

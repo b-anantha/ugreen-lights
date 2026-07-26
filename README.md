@@ -1,31 +1,11 @@
 # ugreen-lights
 
-Drive the front-panel LEDs on a UGREEN DXP-series NAS (tested target: **DXP4800
-Plus**) from real system state — ZFS pool health, disk presence, and network
-connectivity — while running **inside a Docker container** on TrueNAS.
+Drive the front-panel LEDs on a UGREEN DXP-series NAS (developed and running on a
+**DXP4800 Plus**) from real system state — ZFS pool health, disk presence, and
+network connectivity — from **inside a Docker container** on TrueNAS SCALE.
 
 It wraps the [`ugreen_leds_controller`](https://github.com/miskcoo/ugreen_leds_controller)
-CLI (vendored as a submodule) with a status script, [`lights.sh`](lights.sh).
-
-## Why the CLI approach (and why it works in Docker)
-
-The upstream project offers two ways to control the LEDs:
-
-- **A kernel module** (`led-ugreen`) + `/sys/class/leds` + kernel LED triggers.
-  Prettier (can flicker on real disk I/O), but needs an out-of-tree module
-  built and loaded against the host kernel — painful and non-persistent on
-  TrueNAS, and it can't be driven from inside a container.
-- **The `ugreen_leds_cli` tool**, which pokes the SMBus/I2C controller
-  directly. **No kernel module required.** This is what we use, and it's why
-  this runs cleanly in a container.
-
-The one thing the container can't do is *load* the `i2c-dev` kernel module —
-that has to happen on the **TrueNAS host** (modules are global to the host
-kernel). Once it's loaded, the container just needs the `/dev/i2c-*` node and
-the host `/sys` (already mounted). See setup below.
-
-Trade-off: because we don't use the kernel module, the disk LEDs show **health
-status**, not live read/write flicker.
+CLI (vendored as a git submodule) with a status script, [`lights.sh`](lights.sh).
 
 ## What the LEDs show
 
@@ -41,76 +21,127 @@ status**, not live read/write flicker.
 | Disk present but not in any pool | 🔵 blue, solid |
 | Empty bay | ⚫ off |
 
-(When a pool member is missing and a bay is empty — i.e. you pulled a drive —
-empty bays blink red. ZFS often only knows the missing vdev by GUID, so if you
-have more than one empty bay any of them may carry the alert.)
+When a pool member is missing *and* a bay is empty (you pulled a drive), empty
+bays blink red. ZFS often only knows a missing vdev by its GUID, so if you have
+more than one empty bay any of them may carry the alert.
 
 **Network LED (netdev):** 🟢 link up + gateway reachable · 🟠 link up but
 gateway unreachable · 🔴 blinking, link down.
 
 **Power LED:** aggregate pool health — ⚪ white all healthy · 🟠 amber any
-pool degraded/warning · 🔴 red any pool faulted.
+pool degraded/warning · 🔴 red any pool faulted. (So an amber power light with
+everything else green means a pool needs attention — check `zpool status`.)
 
 Colors, brightness, blink timing and checks are all configurable — see
 [`ugreen-leds.conf`](ugreen-leds.conf) or the equivalent environment variables
 (the config file and env vars share names).
 
+## Why the CLI approach (and why it works in Docker)
+
+Upstream offers two ways to control the LEDs:
+
+- **A kernel module** (`led-ugreen`) + `/sys/class/leds` + kernel LED triggers.
+  Prettier (can flicker on real disk I/O), but needs an out-of-tree module built
+  and loaded against the host kernel — painful and non-persistent on TrueNAS, and
+  it can't be driven from a container.
+- **The `ugreen_leds_cli` tool**, which pokes the SMBus/I2C controller directly.
+  **No kernel module required.** This is what we use, and it's why it runs
+  cleanly in a container.
+
+Trade-off: without the kernel module the disk LEDs show **health status**, not
+live read/write flicker — which is exactly what we want here.
+
 ## Setup on TrueNAS SCALE
 
 ### 1. Load `i2c-dev` on the host
 
-Confirm the controller is visible and note the bus number:
+The one thing the container *can't* do is load a kernel module (modules are
+global to the host kernel). Load it on the host and confirm the LED chip answers:
 
 ```bash
 sudo modprobe i2c-dev
-i2cdetect -l                 # find the "SMBus I801 adapter" -> i2c-0 on DXP4800 Plus
-i2cdetect -y 0               # you should see a device at address 0x3a
+sudo i2cdetect -l     # find the "SMBus I801 adapter"  ->  i2c-0 on the DXP4800 Plus
+sudo i2cdetect -y 0   # you should see a device at address 0x3a
 ```
 
-> The SMBus I801 adapter is **`i2c-0`** on the DXP4800 Plus (other buses are the
-> Synopsys DesignWare and i915 GPU buses — ignore them). The CLI auto-selects
-> the I801 bus by name, but the container must be given that exact device node.
+> On the DXP4800 Plus the SMBus I801 adapter is **`i2c-0`** (the other buses are
+> the Synopsys DesignWare and i915 GPU buses — ignore them). The CLI auto-selects
+> the I801 bus by name, but the container must be given that device node.
 
-Make it persistent across reboots via a TrueNAS **Init/Shutdown Script**
-(System Settings → Advanced → Init/Shutdown Scripts), command
-`modprobe i2c-dev`, type *Command*, when *Post Init*.
+Make it persist across reboots via a TrueNAS **Init/Shutdown Script**
+(System Settings → Advanced → Init/Shutdown Scripts): command `modprobe i2c-dev`,
+type *Command*, when *Post Init*.
 
-### 2. Run the container
+### 2. Match the container's ZFS to the host's
 
-The i2c bus is already set to `/dev/i2c-0` in [`compose.yaml`](compose.yaml)
-(correct for the DXP4800 Plus). Then:
+The container runs `zpool` against the **host kernel's** OpenZFS via `/dev/zfs`,
+so the userland version must match the host's `major.minor` — the ioctl interface
+changes between releases (a 2.2 userland fails with *"Failed to initialize the
+libzfs library"* against a 2.3 kernel). Check the host:
 
 ```bash
-docker compose up -d --build
-docker compose logs -f
+cat /sys/module/zfs/version     # e.g. 2.3.4-1
 ```
 
-The compose file passes in `/dev/i2c-1`, `/dev/zfs` (so `zpool status` reads
-host pools), the data disks (for SMART), and `pid: host`. If device passthrough
-is awkward on your TrueNAS version, set `privileged: true` and drop the
-`devices:` list.
+The [`Dockerfile`](Dockerfile) builds on Debian 13 "trixie" (OpenZFS **2.3.x**)
+to match TrueNAS SCALE. If you upgrade TrueNAS to a newer ZFS `major.minor`,
+rebuild on a base image that carries that version.
 
-## Verify the disk mapping (important!)
+### 3. Run the container
+
+```bash
+git clone --recurse-submodules <this repo>
+cd ugreen-lights
+sudo docker compose up -d --build
+```
+
+[`compose.yaml`](compose.yaml) already targets `/dev/i2c-0` and runs
+`privileged: true`. Privileged is the pragmatic choice on a NAS: it exposes the
+host's `/dev` (so `/dev/zfs`, the data disks **and their partitions**,
+`/dev/disk/by-partuuid`, and `/dev/i2c-0` are all present with cgroup access).
+A locked-down alternative with an explicit device list is included, commented, in
+the compose file.
+
+> **Note on ZFS vdev names.** TrueNAS creates pools on partitions referenced by
+> partition UUID, so `zpool status` shows vdevs as bare partuuids, not `sdX`.
+> `libblkid` can't read PARTUUIDs inside a container, so the script resolves them
+> to disks by reading the host's `/dev/disk/by-partuuid/*` symlinks — which is
+> why `compose.yaml` mounts `/dev/disk:ro`.
+
+## Verify the disk mapping
 
 Which physical bay is `disk1`? By default we map by **SCSI host number**
-(`HCTL "N:0:0:0" -> disk(N+1)`), which upstream reports is correct for the
-DXP4800 Plus — but you should confirm it once. Run:
+(`HCTL "N:0:0:0" -> disk(N+1)`) — confirmed correct (left-to-right) on the
+DXP4800 Plus. Confirm on yours:
 
 ```bash
-docker compose exec ugreen-lights /app/lights.sh --map
+sudo docker compose exec ugreen-lights /app/lights.sh --map
 ```
 
-This prints a `bay -> device -> serial` table and then lights each bay white,
-one at a time, so you can watch which physical slot each LED belongs to.
+It prints a `bay -> device -> serial -> model` table, then lights each bay white
+one at a time so you can watch which physical slot each LED belongs to.
 
 If the order is wrong, switch to **serial mapping** — bulletproof, because the
-LED follows the disk itself. List your serials with
-`lsblk -S -o NAME,HCTL,SERIAL,MODEL`, then set in `ugreen-leds.conf` (or env):
+LED follows the disk itself regardless of how the kernel names it. Grab the
+serials from the `--map` table (they're read via `smartctl`, since `lsblk`
+serials are blank in a container), then set in `ugreen-leds.conf` or as env vars:
 
 ```ini
 MAPPING_METHOD=serial
 DISK_SERIAL="SN_BAY1 SN_BAY2 SN_BAY3 SN_BAY4"   # left-to-right physical order
 ```
+
+## Operating notes
+
+- **Logs are quiet by design.** `lights.sh` prints a line only when an LED
+  actually changes state — so `docker compose logs` shows each LED once at
+  startup, then stays silent until something really changes (e.g. a disk faults).
+- **Live edits:** uncomment the `./lights.sh:/app/lights.sh:ro` mount in
+  `compose.yaml`, then `docker compose restart` picks up script changes without a
+  rebuild.
+- **Cosmetic hostid warning:** if `zpool status` in the container nags about a
+  hostid mismatch, uncomment the `/etc/hostid` mount in `compose.yaml`. It
+  doesn't affect the LED logic either way.
 
 ## Files
 
@@ -118,6 +149,31 @@ DISK_SERIAL="SN_BAY1 SN_BAY2 SN_BAY3 SN_BAY4"   # left-to-right physical order
 |------|---------|
 | [`lights.sh`](lights.sh) | The status script. One run = one full LED refresh; `--map` verifies mapping. |
 | [`ugreen-leds.conf`](ugreen-leds.conf) | Optional overrides (mount at `/etc/ugreen-leds.conf`). |
-| [`Dockerfile`](Dockerfile) | Builds the CLI from the submodule + runtime image. |
-| [`compose.yaml`](compose.yaml) | TrueNAS deployment (device passthrough, refresh loop). |
+| [`Dockerfile`](Dockerfile) | Builds the CLI from the submodule (Debian trixie / ZFS 2.3.x). |
+| [`compose.yaml`](compose.yaml) | TrueNAS deployment (privileged, `/dev/disk` + `pid: host`, refresh loop). |
 | `ugreen_leds_controller/` | Upstream CLI/kernel-module source (git submodule). |
+
+## Configuration reference
+
+All keys below work as environment variables (in `compose.yaml`) or in
+`ugreen-leds.conf`. Defaults shown.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `UPDATE_INTERVAL` | `5` | Seconds between refreshes. |
+| `NUM_BAYS` | `4` | Number of disk bays / LEDs. |
+| `MAPPING_METHOD` | `hctl` | `hctl` or `serial`. |
+| `HCTL_OFFSET` | `1` | `hctl`: diskLED = SCSI host number + offset. |
+| `DISK_SERIAL` | — | `serial`: serials in physical bay order. |
+| `BRIGHTNESS` | `64` | LED brightness, 0–255. |
+| `BLINK_ON` / `BLINK_OFF` | `400` / `600` | Blink on/off time (ms). |
+| `CHECK_SMART` | `true` | SMART health overlay (needs smartmontools + disks). |
+| `CHECK_GATEWAY` | `true` | Ping the default gateway for the network LED. |
+| `NETDEV_NAME` | auto | Interface to reflect; empty = default-route device. |
+| `COLOR_*` | see conf | Per-state RGB colors. |
+
+## Credits
+
+LED protocol, CLI tool, and kernel module by
+[miskcoo/ugreen_leds_controller](https://github.com/miskcoo/ugreen_leds_controller).
+This repo adds the containerized, ZFS-aware status layer on top.

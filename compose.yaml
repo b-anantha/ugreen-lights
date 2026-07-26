@@ -5,25 +5,25 @@ services:
     container_name: ugreen-lights
     restart: unless-stopped
 
-    # The LED controller lives on the SMBus/I2C bus. The `i2c-dev` module must
-    # be loaded on the TrueNAS HOST first (see README). Then expose the bus:
-    devices:
-      - /dev/i2c-0:/dev/i2c-0      # the "SMBus I801 adapter" bus (i2c-0 on DXP4800 Plus)
-      # For SMART checks and reliable disk enumeration, expose the data disks.
-      # Simpler alternative: use `privileged: true` below and drop this block.
-      - /dev/sda:/dev/sda
-      - /dev/sdb:/dev/sdb
-      - /dev/sdc:/dev/sdc
-      - /dev/sdd:/dev/sdd
+    # Privileged is the pragmatic choice on a NAS: it exposes the host's /dev
+    # (so /dev/zfs, the data disks AND their partitions, /dev/disk/by-partuuid,
+    # and /dev/i2c-0 are all present with cgroup access). This is what makes
+    # `zpool status -L` resolve vdevs to sdX and `libzfs` initialize.
+    privileged: true
 
-    # ZFS lives in the host kernel; the container's `zpool` talks to it via this.
-    volumes:
-      - /dev/zfs:/dev/zfs
-      # Optional: drop overrides here instead of using environment: below.
-      # - ./ugreen-leds.conf:/etc/ugreen-leds.conf:ro
-
-    # Needed so `zpool status` can read host pool state and lsblk sees the bays.
+    # Needed so `zpool status` reads host pool state and lsblk sees the bays.
     pid: host
+
+    volumes:
+      # TrueNAS names ZFS vdevs by partition UUID; these host symlinks let the
+      # script resolve them to sdX (libblkid can't read PARTUUIDs in-container).
+      - /dev/disk:/dev/disk:ro
+      # Optional: silence the cosmetic "hostid mismatch" note from `zpool status`.
+      # - /etc/hostid:/etc/hostid:ro
+      # Optional: edit lights.sh live — then `docker compose restart` (no rebuild).
+      # - ./lights.sh:/app/lights.sh:ro
+      # Optional: mount your config overrides.
+      # - ./ugreen-leds.conf:/etc/ugreen-leds.conf:ro
 
     environment:
       UPDATE_INTERVAL: "5"
@@ -33,5 +33,19 @@ services:
       CHECK_GATEWAY: "true"
       # NETDEV_NAME: "enp2s0"   # leave unset to auto-detect from default route
 
-    # If device passthrough is fiddly on your TrueNAS version, the blunt option:
-    # privileged: true
+    # ---- Locked-down alternative (instead of `privileged: true` above) ----
+    # Grants only what's needed. Note: you must pass each disk AND its
+    # partitions, or `zpool status -L` can't resolve vdevs to sdX.
+    # devices:
+    #   - /dev/i2c-0:/dev/i2c-0    # SMBus I801 bus (i2c-0 on DXP4800 Plus)
+    #   - /dev/zfs:/dev/zfs        # must be a device, not a volume (cgroup access)
+    #   - /dev/sda:/dev/sda
+    #   - /dev/sda2:/dev/sda2      # data partition zpool references
+    #   - /dev/sdb:/dev/sdb
+    #   - /dev/sdb2:/dev/sdb2
+    #   - /dev/sdc:/dev/sdc
+    #   - /dev/sdc2:/dev/sdc2
+    #   - /dev/sdd:/dev/sdd
+    #   - /dev/sdd2:/dev/sdd2
+    # volumes:
+    #   - /dev/disk:/dev/disk:ro   # by-partuuid -> sdX resolution for `-L`

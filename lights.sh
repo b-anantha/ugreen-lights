@@ -104,6 +104,9 @@ set_led() {
         off)   "$UGREEN_CLI" "$led" -off >/dev/null 2>&1 ;;
     esac
 
+    # Only fires on an actual change, so the log is a clean state-change trail
+    # (all LEDs once at startup, then silence until something really changes).
+    log "$led -> $mode${color:+ ($color)}"
     echo "$spec" > "$cache"
 }
 
@@ -128,30 +131,71 @@ state_rank() {
     esac
 }
 
+# Build a partuuid -> whole-disk map from the host's by-partuuid symlinks.
+# TrueNAS names ZFS vdevs by partition UUID, and libblkid can't read PARTUUIDs
+# inside a container, so we resolve via these symlinks (mount /dev/disk in).
+#   /dev/disk/by-partuuid/d67a2f45-... -> ../../sda1   ==>  partuuid_dev[...]=sda
+declare -A partuuid_dev
+build_partuuid_map() {
+    local link target leaf
+    shopt -s nullglob
+    for link in /dev/disk/by-partuuid/*; do
+        target="$(readlink "$link")" || continue     # ../../sda1
+        leaf="${target##*/}"                          # sda1 | nvme0n1p1
+        partuuid_dev["${link##*/}"]="$(strip_part "$leaf")"
+    done
+    shopt -u nullglob
+}
+
+# sda1 -> sda ; nvme0n1p1 -> nvme0n1
+strip_part() { sed -E 's/p?[0-9]+$//' <<<"$1"; }
+
+# Resolve a zpool vdev NAME to a whole-disk name, or "" if unmappable (a GUID,
+# i.e. a member whose disk is gone / label wiped).
+resolve_dev() {
+    local n="$1"
+    [[ -n "${partuuid_dev[$n]:-}" ]] && { echo "${partuuid_dev[$n]}"; return; }
+    [[ "$n" =~ ^(sd[a-z]+)[0-9]*$ ]]           && { echo "${BASH_REMATCH[1]}"; return; }
+    [[ "$n" =~ ^(nvme[0-9]+n[0-9]+)(p[0-9]+)?$ ]] && { echo "${BASH_REMATCH[1]}"; return; }
+    echo ""
+}
+
 gather_zfs() {
     command -v zpool >/dev/null 2>&1 || return 0
     local status
     status="$(zpool status -L 2>/dev/null)" || return 0
+    build_partuuid_map
 
-    # Per-disk vdev lines, e.g. "  sdb2  ONLINE  0 0 0  (resilvering)"
-    local name st rd wr ck rest base cur old
+    # Pool names, so we can skip the pool header rows in the config table.
+    local p
+    declare -A is_pool
+    while read -r _ p; do is_pool["$p"]=1; done \
+        < <(grep -E '^[[:space:]]*pool:' <<<"$status")
+
+    # Walk every leaf vdev row (indented NAME followed by a ZFS state word).
+    local name st rd wr ck rest dev old
     while read -r name st rd wr ck rest; do
-        base="$(sed 's/[0-9]*$//' <<<"$name")"       # sdb2 -> sdb
-        old="${zdev_state[$base]:-ONLINE}"
-        if (( $(state_rank "$st") > $(state_rank "$old") )); then
-            zdev_state[$base]="$st"
-        else
-            zdev_state[$base]="$old"
-        fi
-        if [[ "$rd" != "0" || "$wr" != "0" || "$ck" != "0" || "$rest" == *resilvering* ]]; then
-            zdev_flag[$base]="warn"
-        fi
-    done < <(grep -E '^[[:space:]]+sd[a-z]+[0-9]+[[:space:]]+[A-Z]+' <<<"$status")
+        [[ -n "${is_pool[$name]:-}" ]] && continue           # pool header row
+        case "$name" in                                       # container vdevs
+            mirror-*|raidz*|draid*|spare*|log|logs|cache|special|dedup|replacing-*|indirect-*) continue ;;
+        esac
 
-    # A member shown as UNAVAIL/REMOVED means a disk the pool expects is gone.
-    if grep -qE '[[:space:]](UNAVAIL|REMOVED)[[:space:]]' <<<"$status"; then
-        POOL_MISSING=1
-    fi
+        dev="$(resolve_dev "$name")"
+        if [[ -z "$dev" ]]; then
+            # Unmappable leaf (a bare GUID) = a member whose disk is missing.
+            case "$st" in UNAVAIL|REMOVED|FAULTED|OFFLINE|DEGRADED) POOL_MISSING=1 ;; esac
+            continue
+        fi
+
+        old="${zdev_state[$dev]:-ONLINE}"
+        if (( $(state_rank "$st") > $(state_rank "$old") )); then
+            zdev_state[$dev]="$st"
+        else
+            zdev_state[$dev]="$old"
+        fi
+        [[ "$rd$wr$ck" != "000" || "$rest" == *resilvering* ]] && zdev_flag[$dev]="warn"
+        case "$st" in UNAVAIL|REMOVED) POOL_MISSING=1 ;; esac
+    done < <(grep -E '^[[:space:]]+\S+[[:space:]]+(ONLINE|DEGRADED|FAULTED|OFFLINE|UNAVAIL|REMOVED)[[:space:]]' <<<"$status")
 
     # Aggregate pool health for the power LED.
     local pst
@@ -172,11 +216,16 @@ declare -A bay_dev
 map_bays() {
     if [[ "$MAPPING_METHOD" == "serial" ]]; then
         # serial -> device, then walk DISK_SERIAL in bay order.
-        local name serial bay=0 want
+        # lsblk serials are blank inside a container (no udev db), so fall back
+        # to smartctl, which reads the serial off the drive directly.
+        local dev serial bay=0 want
         declare -A serial_dev
-        while read -r name serial; do
-            [[ -n "$serial" ]] && serial_dev[$serial]="$name"
-        done < <(lsblk -S -o NAME,SERIAL 2>/dev/null | tail -n +2)
+        while read -r dev; do
+            serial="$(lsblk -dno SERIAL "/dev/$dev" 2>/dev/null)"
+            [[ -z "$serial" ]] && serial="$(smartctl -i "/dev/$dev" 2>/dev/null \
+                | sed -n 's/^Serial Number:[[:space:]]*//p')"
+            [[ -n "$serial" ]] && serial_dev[$serial]="$dev"
+        done < <(lsblk -Sndo NAME 2>/dev/null)
         for want in $DISK_SERIAL; do
             bay=$(( bay + 1 ))
             [[ -n "${serial_dev[$want]:-}" ]] && bay_dev[$bay]="${serial_dev[$want]}"
@@ -312,16 +361,20 @@ update_power() {
 verify_map() {
     map_bays
     echo "Mapping method: $MAPPING_METHOD"
-    printf '%-6s %-6s %-24s %s\n' "BAY" "DEV" "SERIAL" "MODEL"
-    local bay dev info
+    printf '%-6s %-6s %-22s %s\n' "BAY" "DEV" "SERIAL" "MODEL"
+    local bay dev serial model
     for (( bay=1; bay<=NUM_BAYS; bay++ )); do
         dev="${bay_dev[$bay]:-}"
         if [[ -z "$dev" ]]; then
-            printf '%-6s %-6s %-24s %s\n' "disk$bay" "-" "(empty)" ""
+            printf '%-6s %-6s %-22s %s\n' "disk$bay" "-" "(empty)" ""
             continue
         fi
-        info="$(lsblk -S -o NAME,SERIAL,MODEL 2>/dev/null | awk -v d="$dev" '$1==d {$1="";print}')"
-        printf '%-6s %-6s %s\n' "disk$bay" "$dev" "$info"
+        # lsblk serials are blank in a container; smartctl reads the real one.
+        serial="$(lsblk -dno SERIAL "/dev/$dev" 2>/dev/null)"
+        [[ -z "$serial" ]] && serial="$(smartctl -i "/dev/$dev" 2>/dev/null \
+            | sed -n 's/^Serial Number:[[:space:]]*//p')"
+        model="$(lsblk -dno MODEL "/dev/$dev" 2>/dev/null)"
+        printf '%-6s %-6s %-22s %s\n' "disk$bay" "$dev" "${serial:-?}" "$model"
     done
 
     [[ -x "$UGREEN_CLI" ]] || { echo "(no CLI / hardware — table only)"; return; }
