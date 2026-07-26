@@ -114,10 +114,11 @@ set_led() {
 # Gather ZFS state once per refresh.
 #   zdev_state[sdX]   = worst vdev state seen for that physical disk
 #   zdev_flag[sdX]    = "warn" if errors or resilvering on that disk
+#   zdev_scrub[sdX]   = 1 if that disk's pool is currently being scrubbed
 #   POOL_MISSING      = 1 if any pool member is UNAVAIL/REMOVED (a pulled disk)
 #   POOL_WORST        = ONLINE | DEGRADED | FAULTED  (aggregate, for power LED)
 # ----------------------------------------------------------------------------
-declare -A zdev_state zdev_flag
+declare -A zdev_state zdev_flag zdev_scrub
 POOL_MISSING=0
 POOL_WORST="ONLINE"
 
@@ -206,6 +207,24 @@ gather_zfs() {
         esac
     done < <(grep -E '^[[:space:]]*state:' <<<"$status")
     (( POOL_MISSING )) && [[ "$POOL_WORST" == "ONLINE" ]] && POOL_WORST="DEGRADED"
+
+    # Mark disks whose pool is being scrubbed, so their LEDs can blink green
+    # (healthy + working) while it runs. Cheap path: only reparse per-pool if a
+    # scrub is happening at all, and attribute it to that pool's disks only.
+    grep -qE '^[[:space:]]*scan:.*scrub in progress' <<<"$status" || return 0
+    local sp spstatus sname sdev
+    for sp in "${!is_pool[@]}"; do
+        spstatus="$(zpool status -L "$sp" 2>/dev/null)"
+        grep -qE '^[[:space:]]*scan:.*scrub in progress' <<<"$spstatus" || continue
+        while read -r sname _; do
+            [[ -n "${is_pool[$sname]:-}" ]] && continue
+            case "$sname" in
+                mirror-*|raidz*|draid*|spare*|log|logs|cache|special|dedup|replacing-*|indirect-*) continue ;;
+            esac
+            sdev="$(resolve_dev "$sname")"
+            [[ -n "$sdev" ]] && zdev_scrub[$sdev]=1
+        done < <(grep -E '^[[:space:]]+\S+[[:space:]]+(ONLINE|DEGRADED|FAULTED|OFFLINE|UNAVAIL|REMOVED)[[:space:]]' <<<"$spstatus")
+    done
 }
 
 # ----------------------------------------------------------------------------
@@ -306,6 +325,9 @@ update_disks() {
                 elif smart_bad "$dev"; then
                     set_led "$led" solid "$COLOR_WARN"
                     log "SMART warning on /dev/$dev (bay $bay)"
+                elif [[ "${zdev_scrub[$dev]:-}" == "1" ]]; then
+                    # healthy, and this disk's pool is being scrubbed -> green blink
+                    set_led "$led" blink "$COLOR_HEALTHY"
                 else
                     set_led "$led" solid "$COLOR_HEALTHY"
                 fi

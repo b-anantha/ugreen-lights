@@ -20,6 +20,7 @@ CLI (vendored as a git submodule) with a status script, [`lights.sh`](lights.sh)
 | State | LED |
 |-------|-----|
 | Online & healthy | 🟢 green, solid |
+| Online & healthy, this disk's pool is **scrubbing** | 🟢 green, **blinking** |
 | Faulted / degraded member | 🔴 red, solid |
 | Drive pulled / `UNAVAIL` / `REMOVED` | 🔴 red, **blinking** |
 | Admin-offline / read-write-cksum errors / SMART warning | 🟠 amber, solid |
