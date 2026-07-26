@@ -1,8 +1,14 @@
 # ugreen-lights
 
-Drive the front-panel LEDs on a UGREEN DXP-series NAS (developed and running on a
-**DXP4800 Plus**) from real system state — ZFS pool health, disk presence, and
-network connectivity — from **inside a Docker container** on TrueNAS SCALE.
+Drive the front-panel LEDs on a UGREEN DXP-series NAS from real system state —
+ZFS pool health, disk presence, and network connectivity — from **inside a Docker
+container** on TrueNAS SCALE.
+
+Developed and running on a **DXP4800 Plus** (4-bay) and a **DXP2800** (2-bay).
+Both use the same LED controller (chip at `0x3a` on the `i2c-0` SMBus I801 bus),
+so the only per-model change is the bay count — set `NUM_BAYS` to match your unit
+(`4` for the 4800 Plus, `2` for the 2800). Other DXP models very likely work the
+same way; adjust `NUM_BAYS` accordingly.
 
 It wraps the [`ugreen_leds_controller`](https://github.com/miskcoo/ugreen_leds_controller)
 CLI (vendored as a git submodule) with a status script, [`lights.sh`](lights.sh).
@@ -60,13 +66,15 @@ global to the host kernel). Load it on the host and confirm the LED chip answers
 
 ```bash
 sudo modprobe i2c-dev
-sudo i2cdetect -l     # find the "SMBus I801 adapter"  ->  i2c-0 on the DXP4800 Plus
+sudo i2cdetect -l     # find the "SMBus I801 adapter"  ->  i2c-0 on DXP4800 Plus / DXP2800
 sudo i2cdetect -y 0   # you should see a device at address 0x3a
 ```
 
-> On the DXP4800 Plus the SMBus I801 adapter is **`i2c-0`** (the other buses are
-> the Synopsys DesignWare and i915 GPU buses — ignore them). The CLI auto-selects
-> the I801 bus by name, but the container must be given that device node.
+> On both the DXP4800 Plus and the DXP2800 the SMBus I801 adapter is **`i2c-0`**
+> (the other buses are the Synopsys DesignWare and i915 GPU buses — ignore them,
+> along with any other addresses on `i2c-0`; the LED chip is `0x3a`). The CLI
+> auto-selects the I801 bus by name, but the container must be given that device
+> node.
 
 Make it persist across reboots via a TrueNAS **Init/Shutdown Script**
 (System Settings → Advanced → Init/Shutdown Scripts): command `modprobe i2c-dev`,
@@ -142,6 +150,13 @@ DISK_SERIAL="SN_BAY1 SN_BAY2 SN_BAY3 SN_BAY4"   # left-to-right physical order
 - **Cosmetic hostid warning:** if `zpool status` in the container nags about a
   hostid mismatch, uncomment the `/etc/hostid` mount in `compose.yaml`. It
   doesn't affect the LED logic either way.
+- **Reboot ordering is handled for you.** The LED state cache lives on a tmpfs
+  (`/run/ugreen-leds`), so it starts empty on every container start and all LEDs
+  are re-applied to the hardware. That matters because on boot the container can
+  come up *before* `i2c-dev` is loaded on the host — without the fresh cache, the
+  script would record "already set" while the hardware never got the command, and
+  the LEDs would stay in their default blink. The Post Init `modprobe` (step 1)
+  plus the tmpfs cache make the boot sequence robust either way.
 
 ## Files
 
@@ -161,7 +176,7 @@ All keys below work as environment variables (in `compose.yaml`) or in
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `UPDATE_INTERVAL` | `5` | Seconds between refreshes. |
-| `NUM_BAYS` | `4` | Number of disk bays / LEDs. |
+| `NUM_BAYS` | `4` | Number of disk bays / LEDs (`4` = DXP4800 Plus, `2` = DXP2800). |
 | `MAPPING_METHOD` | `hctl` | `hctl` or `serial`. |
 | `HCTL_OFFSET` | `1` | `hctl`: diskLED = SCSI host number + offset. |
 | `DISK_SERIAL` | — | `serial`: serials in physical bay order. |

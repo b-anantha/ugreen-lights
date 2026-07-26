@@ -14,6 +14,13 @@ services:
     # Needed so `zpool status` reads host pool state and lsblk sees the bays.
     pid: host
 
+    # The LED state cache lives here. tmpfs makes it empty on every container
+    # start/restart, so all LEDs are re-applied to the hardware each time the
+    # container comes up (important if i2c-dev loads on the host *after* a boot).
+    # Within a single run it still suppresses redundant I2C writes.
+    tmpfs:
+      - /run/ugreen-leds
+
     volumes:
       # TrueNAS names ZFS vdevs by partition UUID; these host symlinks let the
       # script resolve them to sdX (libblkid can't read PARTUUIDs in-container).
@@ -27,7 +34,7 @@ services:
 
     environment:
       UPDATE_INTERVAL: "5"
-      NUM_BAYS: "4"
+      NUM_BAYS: "4"            # 4 = DXP4800 Plus, 2 = DXP2800
       BRIGHTNESS: "64"
       CHECK_SMART: "true"
       CHECK_GATEWAY: "true"
