@@ -1,0 +1,3 @@
+[submodule "ugreen_leds_controller"]
+	path = ugreen_leds_controller
+	url = https://github.com/miskcoo/ugreen_leds_controller.git
