@@ -88,21 +88,34 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 # set_led <led> <mode> <R G B>
 #   mode = solid | blink | off
 # Skips the CLI call if the LED is already in exactly this state (cache).
+# The cache is only written when the CLI succeeds: caching a failed write would
+# make every later run skip that LED, leaving it in the controller's default
+# boot chase while the log claims it was set. Failures set LED_FAILED so main()
+# can exit non-zero.
 # ----------------------------------------------------------------------------
+LED_FAILED=0
+
 set_led() {
     local led="$1" mode="$2" color="${3:-}"
     local spec="$mode|$color|$BRIGHTNESS|$BLINK_ON|$BLINK_OFF"
     local cache="$STATE_DIR/$led"
+    local rc=0
 
     if [[ -f "$cache" && "$(<"$cache")" == "$spec" ]]; then
         return 0    # unchanged — leave the LED alone
     fi
 
     case "$mode" in
-        solid) "$UGREEN_CLI" "$led" -color $color -on -brightness "$BRIGHTNESS" >/dev/null 2>&1 ;;
-        blink) "$UGREEN_CLI" "$led" -color $color -blink "$BLINK_ON" "$BLINK_OFF" -brightness "$BRIGHTNESS" >/dev/null 2>&1 ;;
-        off)   "$UGREEN_CLI" "$led" -off >/dev/null 2>&1 ;;
+        solid) "$UGREEN_CLI" "$led" -color $color -on -brightness "$BRIGHTNESS" >/dev/null 2>&1 || rc=$? ;;
+        blink) "$UGREEN_CLI" "$led" -color $color -blink "$BLINK_ON" "$BLINK_OFF" -brightness "$BRIGHTNESS" >/dev/null 2>&1 || rc=$? ;;
+        off)   "$UGREEN_CLI" "$led" -off >/dev/null 2>&1 || rc=$? ;;
     esac
+
+    if (( rc != 0 )); then
+        log "ERROR: $led -> $mode failed (ugreen_leds_cli exit $rc)"
+        LED_FAILED=1
+        return 1
+    fi
 
     # Only fires on an actual change, so the log is a clean state-change trail
     # (all LEDs once at startup, then silence until something really changes).
@@ -423,11 +436,27 @@ main() {
         exit 1
     fi
 
+    # A privileged container gets a snapshot of the host's /dev taken at
+    # container start; device nodes created later never appear in it. At boot
+    # Docker can start us before `modprobe i2c-dev` has run, and then no
+    # /dev/i2c-* will ever show up here. Exit non-zero so the Dockerfile loop
+    # ends and `restart: unless-stopped` brings up a fresh container with a
+    # fresh /dev, retrying until the module is loaded.
+    if ! compgen -G "/dev/i2c-*" >/dev/null; then
+        log "ERROR: no /dev/i2c-* in the container (is i2c-dev loaded on the host?); exiting so Docker restarts us"
+        exit 1
+    fi
+
     gather_zfs
     map_bays
     update_power
     update_netdev
     update_disks
+
+    if (( LED_FAILED )); then
+        log "ERROR: LED writes failed; exiting so Docker restarts us"
+        exit 1
+    fi
 }
 
 main "$@"

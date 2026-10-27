@@ -49,4 +49,7 @@ RUN chmod +x /app/ugreen_leds_cli /app/lights.sh
 ENV UPDATE_INTERVAL=5
 
 # Refresh the LEDs forever. One `lights.sh` call = one full refresh.
-CMD ["/bin/bash", "-c", "while true; do /app/lights.sh; sleep \"${UPDATE_INTERVAL}\"; done"]
+# A failing refresh (no /dev/i2c-*, or an LED write failed) ends the loop and
+# the container, so `restart: unless-stopped` starts a fresh one — with a fresh
+# /dev snapshot, which is what picks up an i2c-dev loaded after boot.
+CMD ["/bin/bash", "-c", "while /app/lights.sh; do sleep \"${UPDATE_INTERVAL}\"; done; exit 1"]

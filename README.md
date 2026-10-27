@@ -79,7 +79,8 @@ sudo i2cdetect -y 0   # you should see a device at address 0x3a
 
 Make it persist across reboots via a TrueNAS **Init/Shutdown Script**
 (System Settings → Advanced → Init/Shutdown Scripts): command `modprobe i2c-dev`,
-type *Command*, when *Post Init*.
+type *Command*, when *Pre Init* (so it runs before apps start; see
+"Reboot ordering" below).
 
 ### 2. Match the container's ZFS to the host's
 
@@ -151,13 +152,17 @@ DISK_SERIAL="SN_BAY1 SN_BAY2 SN_BAY3 SN_BAY4"   # left-to-right physical order
 - **Cosmetic hostid warning:** if `zpool status` in the container nags about a
   hostid mismatch, uncomment the `/etc/hostid` mount in `compose.yaml`. It
   doesn't affect the LED logic either way.
-- **Reboot ordering is handled for you.** The LED state cache lives on a tmpfs
-  (`/run/ugreen-leds`), so it starts empty on every container start and all LEDs
-  are re-applied to the hardware. That matters because on boot the container can
-  come up *before* `i2c-dev` is loaded on the host — without the fresh cache, the
-  script would record "already set" while the hardware never got the command, and
-  the LEDs would stay in their default blink. The Post Init `modprobe` (step 1)
-  plus the tmpfs cache make the boot sequence robust either way.
+- **Reboot ordering is handled for you.** On boot the container can come up
+  *before* `i2c-dev` is loaded on the host. A privileged container only sees a
+  snapshot of the host's `/dev` taken when it starts, so a `/dev/i2c-*` created
+  later never appears inside it — restarting the container is the only way to
+  pick it up. So `lights.sh` exits non-zero when there is no `/dev/i2c-*` or an
+  LED write fails, the container stops, and `restart: unless-stopped` brings up
+  a fresh one, retrying until the module is loaded. A failed write is never
+  cached, and the cache itself lives on a tmpfs (`/run/ugreen-leds`), so every
+  new container re-applies all LEDs. To make the first start succeed, run the
+  `modprobe` from step 1 as **Pre Init** rather than Post Init, so the module is
+  loaded before apps start.
 
 ## Files
 
